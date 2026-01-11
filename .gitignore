@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+.DS_Store
+*.wav
+*.mp3
+temp_input/
+separated_stems/

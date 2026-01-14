@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 \
     git \
     procps \
+    nginx \
     && rm -rf /var/lib/apt/lists/*
 
 # Work directory
@@ -18,11 +19,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . /app
 
+# Copy Nginx config
+COPY nginx.conf /etc/nginx/nginx.conf
+
 # Expose ports
-# 8000 = API (FastAPI)
-# 8501 = Admin (Streamlit)
-EXPOSE 8000
-EXPOSE 8501
+# We expose 8080 for Nginx (Main Entry)
+EXPOSE 8080
 
 # Environment variables
 ENV PORT=8000

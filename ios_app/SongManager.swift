@@ -23,8 +23,8 @@ struct Song: Identifiable, Codable {
 class SongService: ObservableObject {
     @Published var songs: [Song] = []
     
-    // REPLACE WITH YOUR MAC'S IP ADDRESS
-    let baseURL = "http://192.168.1.15:8000" 
+    // LINK DO RAILWAY (CLOUD)
+    let baseURL = "https://audio-studio-production-3c56.up.railway.app" 
     
     func fetchSongs() {
         guard let url = URL(string: "\(baseURL)/songs") else { return }

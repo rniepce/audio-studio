@@ -9,3 +9,5 @@ font = "sans serif"
 [server]
 headless = true
 maxUploadSize = 2000
+enableCORS = false
+enableXsrfProtection = false

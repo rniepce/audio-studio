@@ -1,0 +1,17 @@
+
+streamlit
+fastapi
+uvicorn
+python-multipart
+pydantic
+pedalboard
+soundfile
+numpy
+demucs
+noisereduce
+torch
+scipy
+
+librosa
+basic-pitch
+

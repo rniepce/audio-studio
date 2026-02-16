@@ -117,11 +117,13 @@ class AudioPlayer: ObservableObject {
         isPlaying = true
         
         // Get duration
-        item.asset.loadValuesAsynchronously(forKeys: ["duration"]) {
-            DispatchQueue.main.async {
-                let seconds = CMTimeGetSeconds(item.asset.duration)
+        Task {
+            if let duration = try? await item.asset.load(.duration) {
+                let seconds = CMTimeGetSeconds(duration)
                 if seconds.isFinite && seconds > 0 {
-                    self.duration = seconds
+                    await MainActor.run {
+                        self.duration = seconds
+                    }
                 }
             }
         }
@@ -201,7 +203,7 @@ struct SongCardView: View {
                 .font(.title3)
         }
         .padding()
-        .glassEffect(.regular.interactive, in: .rect(cornerRadius: 20))
+        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 20))
     }
 }
 
@@ -225,10 +227,9 @@ struct ContentView: View {
             .navigationTitle("Setlist")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Image("NavIcon")
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 30, height: 30)
+                    Image(systemName: "music.note.list")
+                        .font(.title3)
+                        .symbolRenderingMode(.hierarchical)
                 }
             }
             .onAppear {
@@ -311,7 +312,7 @@ struct SongDetailView: View {
                                 }
                             }
                             .padding(.horizontal, 20)
-                            .onChange(of: player.currentTime) { newValue in
+                            .onChange(of: player.currentTime) { _, newValue in
                                 if !player.isSeeking {
                                     sliderValue = newValue
                                 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import Combine
 
 // MARK: - Models
 struct Song: Identifiable, Codable {
@@ -52,6 +53,11 @@ class SongService: ObservableObject {
 class AudioPlayer: ObservableObject {
     var player: AVPlayer?
     @Published var isPlaying = false
+    @Published var currentTime: Double = 0
+    @Published var duration: Double = 0
+    @Published var isSeeking = false
+    
+    private var timeObserver: Any?
     
     func play(url: URL) {
         // Configure for background playback
@@ -66,6 +72,24 @@ class AudioPlayer: ObservableObject {
         player = AVPlayer(playerItem: item)
         player?.play()
         isPlaying = true
+        
+        // Observe duration once the item is ready
+        item.asset.loadValuesAsynchronously(forKeys: ["duration"]) {
+            DispatchQueue.main.async {
+                let seconds = CMTimeGetSeconds(item.asset.duration)
+                if seconds.isFinite {
+                    self.duration = seconds
+                }
+            }
+        }
+        
+        // Periodic time observer — update every 0.25s
+        removeTimeObserver()
+        let interval = CMTime(seconds: 0.25, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self, !self.isSeeking else { return }
+            self.currentTime = CMTimeGetSeconds(time)
+        }
     }
     
     func toggle() {
@@ -77,11 +101,34 @@ class AudioPlayer: ObservableObject {
         isPlaying.toggle()
     }
     
+    func seek(to time: Double) {
+        let cmTime = CMTime(seconds: time, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        player?.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+    
     func stop() {
+        removeTimeObserver()
         player?.pause()
         player = nil
         isPlaying = false
+        currentTime = 0
+        duration = 0
     }
+    
+    private func removeTimeObserver() {
+        if let observer = timeObserver {
+            player?.removeTimeObserver(observer)
+            timeObserver = nil
+        }
+    }
+}
+
+// MARK: - Time Formatter
+func formatTime(_ seconds: Double) -> String {
+    guard seconds.isFinite && seconds >= 0 else { return "0:00" }
+    let mins = Int(seconds) / 60
+    let secs = Int(seconds) % 60
+    return String(format: "%d:%02d", mins, secs)
 }
 
 // MARK: - Views
@@ -119,39 +166,87 @@ struct SongDetailView: View {
     @State private var fontSize: CGFloat = 18
     
     var body: some View {
-        VStack {
-            // Header & Player
-            VStack(spacing: 10) {
-                Text(song.title).font(.largeTitle).bold()
-                Text(song.artist).font(.title2).foregroundColor(.gray)
+        VStack(spacing: 0) {
+            // --- Header: Title + Artist ---
+            VStack(spacing: 4) {
+                Text(song.title)
+                    .font(.title)
+                    .bold()
+                Text(song.artist)
+                    .font(.title3)
+                    .foregroundColor(.gray)
+            }
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+            
+            // --- Audio Player Section ---
+            if let audioFile = song.audio_filename,
+               let url = service.getAudioURL(filename: audioFile) {
                 
-                if let audioFile = song.audio_filename, let url = service.getAudioURL(filename: audioFile) {
-                    HStack {
-                        Button(action: { player.toggle() }) {
-                            Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                                .font(.system(size: 50))
-                        }
-                        .onAppear {
-                            // Auto-play removed for safety, user click to play
+                VStack(spacing: 10) {
+                    // Play/Pause Button
+                    Button(action: {
+                        if !player.isPlaying && player.player == nil {
                             player.play(url: url)
-                            player.player?.pause() 
-                            player.isPlaying = false
+                        } else {
+                            player.toggle()
+                        }
+                    }) {
+                        Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 50))
+                            .foregroundColor(.blue)
+                    }
+                    
+                    // --- Progress Slider ---
+                    VStack(spacing: 4) {
+                        Slider(
+                            value: Binding(
+                                get: { player.currentTime },
+                                set: { newValue in
+                                    player.currentTime = newValue
+                                    player.seek(to: newValue)
+                                }
+                            ),
+                            in: 0...(max(player.duration, 0.01)),
+                            onEditingChanged: { editing in
+                                player.isSeeking = editing
+                            }
+                        )
+                        .tint(.blue)
+                        
+                        HStack {
+                            Text(formatTime(player.currentTime))
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(formatTime(player.duration))
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundColor(.secondary)
                         }
                     }
-                } else {
-                    Text("Sem Áudio").font(.caption).foregroundColor(.red)
+                    .padding(.horizontal, 20)
                 }
+                .padding(.vertical, 8)
+                
+            } else {
+                Text("Sem Áudio")
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .padding(.vertical, 8)
             }
-            .padding()
             
+            // --- Lyrics / Chords Toggle ---
             Picker("View", selection: $showLyrics) {
                 Text("Letra").tag(true)
                 Text("Cifra").tag(false)
             }
             .pickerStyle(SegmentedPickerStyle())
             .padding(.horizontal)
+            .padding(.vertical, 4)
             
-            // Content
+            // --- Content ---
             ScrollView {
                 Text(showLyrics ? song.lyrics : song.chords_text)
                     .font(.system(size: fontSize, design: showLyrics ? .default : .monospaced))
@@ -159,13 +254,14 @@ struct SongDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             
-            // Controls
+            // --- Font Size Control ---
             HStack {
                 Button("A-") { if fontSize > 10 { fontSize -= 2 } }
                 Slider(value: $fontSize, in: 10...30)
                 Button("A+") { if fontSize < 40 { fontSize += 2 } }
             }
-            .padding()
+            .padding(.horizontal)
+            .padding(.bottom, 8)
         }
         .onDisappear {
             player.stop()

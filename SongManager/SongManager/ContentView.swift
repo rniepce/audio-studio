@@ -6,7 +6,6 @@
 //
 
 import SwiftUI
-import SwiftUI
 import AVFoundation
 import Combine
 
@@ -55,12 +54,52 @@ class SongService: ObservableObject {
     func getAudioURL(filename: String) -> URL? {
         return URL(string: "\(baseURL)/files/\(filename)")
     }
+    
+    func updateSong(_ song: Song, completion: @escaping (Bool) -> Void) {
+        guard let url = URL(string: "\(baseURL)/songs/\(song.id)") else { return }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        do {
+            request.httpBody = try JSONEncoder().encode(song)
+            
+            URLSession.shared.dataTask(with: request) { _, response, error in
+                if let error = error {
+                    print("Error updating song: \(error)")
+                    DispatchQueue.main.async { completion(false) }
+                    return
+                }
+                
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                    DispatchQueue.main.async {
+                        // Update local list
+                        if let index = self.songs.firstIndex(where: { $0.id == song.id }) {
+                            self.songs[index] = song
+                        }
+                        completion(true)
+                    }
+                } else {
+                    DispatchQueue.main.async { completion(false) }
+                }
+            }.resume()
+        } catch {
+            print("Error encoding song: \(error)")
+            completion(false)
+        }
+    }
 }
 
 // MARK: - Audio Player
 class AudioPlayer: ObservableObject {
     var player: AVPlayer?
     @Published var isPlaying = false
+    @Published var currentTime: Double = 0.0
+    @Published var duration: Double = 1.0
+    @Published var isSeeking = false
+    
+    private var timeObserver: Any?
     
     func play(url: URL) {
         do {
@@ -76,6 +115,27 @@ class AudioPlayer: ObservableObject {
         player = AVPlayer(playerItem: item)
         player?.play()
         isPlaying = true
+        
+        // Get duration
+        item.asset.loadValuesAsynchronously(forKeys: ["duration"]) {
+            DispatchQueue.main.async {
+                let seconds = CMTimeGetSeconds(item.asset.duration)
+                if seconds.isFinite && seconds > 0 {
+                    self.duration = seconds
+                }
+            }
+        }
+        
+        // Time observer - updates every 0.5s
+        removeTimeObserver()
+        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+        timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self, !self.isSeeking else { return }
+            let t = CMTimeGetSeconds(time)
+            if t.isFinite {
+                self.currentTime = t
+            }
+        }
     }
     
     func toggle() {
@@ -87,33 +147,90 @@ class AudioPlayer: ObservableObject {
         isPlaying.toggle()
     }
     
+    func seek(to time: Double) {
+        let target = CMTime(seconds: time, preferredTimescale: 600)
+        player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+    
     func stop() {
+        removeTimeObserver()
         player?.pause()
         player = nil
         isPlaying = false
+        currentTime = 0
+        duration = 1.0
+    }
+    
+    private func removeTimeObserver() {
+        if let obs = timeObserver {
+            player?.removeTimeObserver(obs)
+            timeObserver = nil
+        }
     }
 }
 
-// MARK: - Views
+// MARK: - Helper
+func formatTime(_ seconds: Double) -> String {
+    guard seconds.isFinite && seconds >= 0 else { return "0:00" }
+    let m = Int(seconds) / 60
+    let s = Int(seconds) % 60
+    return String(format: "%d:%02d", m, s)
+}
+
+// MARK: - Song Card
+struct SongCardView: View {
+    let song: Song
+    
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(song.title)
+                    .font(.system(.headline, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .bold()
+                
+                if !song.artist.isEmpty {
+                    Text(song.artist)
+                        .font(.system(.subheadline, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Image(systemName: "music.note")
+                .foregroundStyle(.secondary)
+                .font(.title3)
+        }
+        .padding()
+        .glassEffect(.regular.interactive, in: .rect(cornerRadius: 20))
+    }
+}
+
+// MARK: - Main View
 struct ContentView: View {
     @StateObject var service = SongService()
     
     var body: some View {
-        NavigationView {
-            List(service.songs) { song in
-                NavigationLink(destination: SongDetailView(song: song, service: service)) {
-                    VStack(alignment: .leading) {
-                        Text(song.title)
-                            .font(.headline)
-                        if !song.artist.isEmpty {
-                            Text(song.artist)
-                                .font(.subheadline)
-                                .foregroundColor(.gray)
+        NavigationStack {
+            ScrollView {
+                LazyVStack(spacing: 15) {
+                    ForEach(service.songs) { song in
+                        NavigationLink(destination: SongDetailView(song: song, service: service)) {
+                            SongCardView(song: song)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
+                .padding()
             }
-            .navigationTitle("Setlist 🎸")
+            .navigationTitle("Setlist")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Image("NavIcon")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 30, height: 30)
+                }
+            }
             .onAppear {
                 service.fetchSongs()
             }
@@ -121,62 +238,209 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Detail View
 struct SongDetailView: View {
     let song: Song
     @ObservedObject var service: SongService
     @StateObject var player = AudioPlayer()
+    
     @State private var showLyrics = true
     @State private var fontSize: Double = 18
+    @State private var sliderValue: Double = 0
+    
+    // Edit Mode State
+    @State private var isEditing = false
+    @State private var editedLyrics: String = ""
+    @State private var editedChords: String = ""
+    @State private var isSaving = false
+    
+    @Environment(\.dismiss) var dismiss
     
     var body: some View {
-        VStack {
-            VStack(spacing: 10) {
-                Text(song.title).font(.largeTitle).bold()
-                Text(song.artist).font(.title2).foregroundColor(.gray)
+        VStack(spacing: 0) {
+            // Header (Title & Artist)
+            VStack(spacing: 4) {
+                Text(song.title)
+                    .font(.system(.title, design: .rounded))
+                    .fontWeight(.heavy)
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.center)
                 
+                Text(song.artist)
+                    .font(.system(.subheadline, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 5)
+            .padding(.horizontal)
+            
+            if !isEditing {
+                // Player Card
                 if let audioFile = song.audio_filename, let url = service.getAudioURL(filename: audioFile) {
-                    HStack {
-                        Button(action: { player.toggle() }) {
-                            Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                                .font(.system(size: 50))
+                    GlassEffectContainer {
+                        VStack(spacing: 8) {
+                            // Play/Pause Button
+                            Button(action: { player.toggle() }) {
+                                Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                    .font(.system(size: 50))
+                                    .symbolRenderingMode(.hierarchical)
+                            }
+                            .buttonStyle(.glass)
+                            
+                            // Progress Slider
+                            VStack(spacing: 4) {
+                                Slider(
+                                    value: $sliderValue,
+                                    in: 0...max(player.duration, 1),
+                                    onEditingChanged: { editing in
+                                        player.isSeeking = editing
+                                        if !editing {
+                                            player.seek(to: sliderValue)
+                                        }
+                                    }
+                                )
+                                .tint(.primary)
+                                
+                                HStack {
+                                    Text(formatTime(sliderValue))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text(formatTime(player.duration))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 20)
+                            .onChange(of: player.currentTime) { newValue in
+                                if !player.isSeeking {
+                                    sliderValue = newValue
+                                }
+                            }
                         }
-                        .onAppear {
-                            player.play(url: url)
-                            player.player?.pause()
-                            player.isPlaying = false
-                        }
+                        .padding(15)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 20))
+                    }
+                    .padding(.horizontal)
+                    .padding(.vertical, 10)
+                    .onAppear {
+                        player.play(url: url)
+                        player.player?.pause()
+                        player.isPlaying = false
                     }
                 } else {
-                    Text("Sem Áudio").font(.caption).foregroundColor(.red)
+                    Text("Sem áudio disponível")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.vertical, 10)
                 }
             }
-            .padding()
             
+            // Segmented Control
             Picker("View", selection: $showLyrics) {
                 Text("Letra").tag(true)
                 Text("Cifra").tag(false)
             }
-            .pickerStyle(SegmentedPickerStyle())
+            .pickerStyle(.segmented)
             .padding(.horizontal)
+            .padding(.bottom, 10)
             
-            ScrollView {
-                Text(showLyrics ? song.lyrics : song.chords_text)
-                    .font(.system(size: CGFloat(fontSize), design: showLyrics ? .default : .monospaced))
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            // Content
+            if isEditing {
+                if showLyrics {
+                    TextEditor(text: $editedLyrics)
+                        .scrollContentBackground(.hidden)
+                        .font(.system(size: 16, design: .rounded))
+                        .padding()
+                        .background(.regularMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 20))
+                        .padding(.horizontal)
+                } else {
+                    TextEditor(text: $editedChords)
+                        .scrollContentBackground(.hidden)
+                        .font(.system(size: 16, design: .monospaced))
+                        .padding()
+                        .background(.regularMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 20))
+                        .padding(.horizontal)
+                }
+            } else {
+                ScrollView {
+                    Text(showLyrics ? song.lyrics : song.chords_text)
+                        .font(.system(size: CGFloat(fontSize), design: showLyrics ? .default : .monospaced))
+                        .foregroundStyle(.primary)
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .background(.regularMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .padding(.horizontal)
+                
+                // Font Size Control
+                HStack {
+                    Image(systemName: "textformat.size.smaller")
+                        .foregroundStyle(.secondary)
+                    Slider(value: $fontSize, in: 10...40)
+                        .tint(.primary)
+                    Image(systemName: "textformat.size.larger")
+                        .foregroundStyle(.secondary)
+                }
+                .padding()
+                .glassEffect(.regular, in: .rect(cornerRadius: 16))
+                .padding()
             }
             
-            HStack {
-                Button("A-") { if fontSize > 10 { fontSize -= 2 } }
-                Slider(value: $fontSize, in: 10...30)
-                Button("A+") { if fontSize < 40 { fontSize += 2 } }
+            if isEditing {
+                Button("Cancelar", role: .cancel) {
+                    isEditing = false
+                }
+                .buttonStyle(.glass)
+                .padding(.bottom, 10)
             }
-            .padding()
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button(action: {
+                    if isEditing {
+                        saveChanges()
+                    } else {
+                        startEditing()
+                    }
+                }) {
+                    Text(isEditing ? "Salvar" : "Editar")
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(isSaving)
+            }
         }
         .onDisappear {
             player.stop()
         }
     }
+    
+    func startEditing() {
+        editedLyrics = song.lyrics
+        editedChords = song.chords_text
+        isEditing = true
+    }
+    
+    func saveChanges() {
+        isSaving = true
+        let updatedSong = Song(
+            id: song.id,
+            title: song.title,
+            artist: song.artist,
+            lyrics: editedLyrics,
+            chords_text: editedChords,
+            audio_filename: song.audio_filename,
+            pdf_filename: song.pdf_filename
+        )
+        
+        service.updateSong(updatedSong) { success in
+            isSaving = false
+            if success {
+                isEditing = false
+            }
+        }
+    }
 }
-
-

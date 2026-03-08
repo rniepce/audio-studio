@@ -250,6 +250,34 @@ class SongStore: ObservableObject {
         updateSong(updated)
         return updated
     }
+    
+    /// Temporary URL for recording audio
+    func recordingURL(for song: Song) -> URL {
+        return audioDir.appendingPathComponent("\(song.id.uuidString)_recording.m4a")
+    }
+    
+    /// Save a recorded file as the song's audio
+    func saveRecording(from recordingURL: URL, for song: Song) -> Song {
+        let filename = "\(song.id.uuidString)_audio.m4a"
+        let dest = audioDir.appendingPathComponent(filename)
+        
+        // Remove old audio
+        if let oldFile = song.audioFilename {
+            let oldURL = audioDir.appendingPathComponent(oldFile)
+            try? FileManager.default.removeItem(at: oldURL)
+        }
+        
+        // Move recording to final destination
+        if dest != recordingURL {
+            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.moveItem(at: recordingURL, to: dest)
+        }
+        
+        var updated = song
+        updated.audioFilename = filename
+        updateSong(updated)
+        return updated
+    }
 }
 
 // MARK: - Audio Player
@@ -317,6 +345,67 @@ class AudioPlayer: ObservableObject {
             player?.removeTimeObserver(obs)
             timeObserver = nil
         }
+    }
+}
+
+// MARK: - Audio Recorder
+class AudioRecorder: ObservableObject {
+    @Published var isRecording = false
+    @Published var recordingTime: TimeInterval = 0
+    @Published var recordingURL: URL?
+    
+    private var audioRecorder: AVAudioRecorder?
+    private var timer: Timer?
+    
+    func startRecording(to url: URL) {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            try session.setActive(true)
+        } catch {
+            print("Audio session error: \(error)")
+            return
+        }
+        
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100.0,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+        
+        do {
+            audioRecorder = try AVAudioRecorder(url: url, settings: settings)
+            audioRecorder?.record()
+            isRecording = true
+            recordingTime = 0
+            recordingURL = url
+            
+            timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
+                self.recordingTime = self.audioRecorder?.currentTime ?? 0
+            }
+        } catch {
+            print("Recording error: \(error)")
+        }
+    }
+    
+    func stopRecording() {
+        timer?.invalidate()
+        timer = nil
+        audioRecorder?.stop()
+        audioRecorder = nil
+        isRecording = false
+        
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+    
+    func deleteRecording() {
+        if let url = recordingURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        recordingURL = nil
+        recordingTime = 0
     }
 }
 
@@ -626,11 +715,153 @@ struct AddSongView: View {
     }
 }
 
+// MARK: - Recording View
+struct RecordingView: View {
+    @ObservedObject var recorder: AudioRecorder
+    @ObservedObject var previewPlayer: AudioPlayer
+    let onSave: () -> Void
+    let onDiscard: () -> Void
+    
+    @State private var pulseAnimation = false
+    @State private var previewSliderValue: Double = 0
+    
+    var body: some View {
+        VStack(spacing: 16) {
+            if recorder.isRecording {
+                // Recording in progress
+                VStack(spacing: 12) {
+                    // Animated recording indicator
+                    ZStack {
+                        Circle()
+                            .fill(Color.red.opacity(0.15))
+                            .frame(width: 80, height: 80)
+                            .scaleEffect(pulseAnimation ? 1.3 : 1.0)
+                            .opacity(pulseAnimation ? 0.0 : 0.5)
+                        
+                        Circle()
+                            .fill(Color.red.opacity(0.2))
+                            .frame(width: 60, height: 60)
+                        
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 24))
+                            .foregroundStyle(.red)
+                    }
+                    .onAppear {
+                        withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: false)) {
+                            pulseAnimation = true
+                        }
+                    }
+                    
+                    Text(formatTime(recorder.recordingTime))
+                        .font(.system(.title2, design: .monospaced))
+                        .foregroundStyle(.primary)
+                    
+                    Text("Gravando...")
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(.red)
+                    
+                    Button(action: { recorder.stopRecording() }) {
+                        Label("Parar", systemImage: "stop.circle.fill")
+                            .font(.system(.headline, design: .rounded))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 10)
+                            .background(Capsule().fill(.red))
+                    }
+                }
+            } else if recorder.recordingURL != nil {
+                // Recording preview
+                VStack(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button(action: {
+                            if previewPlayer.isPlaying {
+                                previewPlayer.toggle()
+                            } else if let url = recorder.recordingURL {
+                                if previewPlayer.player == nil {
+                                    previewPlayer.play(url: url)
+                                } else {
+                                    previewPlayer.toggle()
+                                }
+                            }
+                        }) {
+                            Image(systemName: previewPlayer.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                .font(.system(size: 40))
+                                .symbolRenderingMode(.hierarchical)
+                        }
+                        .buttonStyle(.glass)
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Gravação")
+                                .font(.system(.subheadline, weight: .semibold, design: .rounded))
+                            Text(formatTime(recorder.recordingTime))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    
+                    VStack(spacing: 4) {
+                        Slider(
+                            value: $previewSliderValue,
+                            in: 0...max(previewPlayer.duration, 1),
+                            onEditingChanged: { editing in
+                                previewPlayer.isSeeking = editing
+                                if !editing { previewPlayer.seek(to: previewSliderValue) }
+                            }
+                        )
+                        .tint(.primary)
+                        
+                        HStack {
+                            Text(formatTime(previewSliderValue))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(formatTime(previewPlayer.duration))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .onChange(of: previewPlayer.currentTime) { _, newValue in
+                        if !previewPlayer.isSeeking { previewSliderValue = newValue }
+                    }
+                    
+                    HStack(spacing: 16) {
+                        Button(action: {
+                            previewPlayer.stop()
+                            onDiscard()
+                        }) {
+                            Label("Descartar", systemImage: "trash")
+                                .font(.system(.subheadline, design: .rounded))
+                                .foregroundStyle(.red)
+                        }
+                        .buttonStyle(.glass)
+                        
+                        Button(action: {
+                            previewPlayer.stop()
+                            onSave()
+                        }) {
+                            Label("Usar Gravação", systemImage: "checkmark.circle.fill")
+                                .font(.system(.subheadline, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(Capsule().fill(.green))
+                        }
+                    }
+                }
+            }
+        }
+        .padding(15)
+        .glassEffect(.regular, in: .rect(cornerRadius: 20))
+    }
+}
+
 // MARK: - Detail View
 struct SongDetailView: View {
     @State var song: Song
     @ObservedObject var store: SongStore
     @StateObject var player = AudioPlayer()
+    @StateObject var recorder = AudioRecorder()
+    @StateObject var previewPlayer = AudioPlayer()
     
     @State private var showLyrics = true
     @State private var fontSize: Double = 18
@@ -643,9 +874,10 @@ struct SongDetailView: View {
     @State private var editedTitle = ""
     @State private var editedArtist = ""
     
-    // Audio Import
+    // Audio Import / Record
     @State private var showAudioPicker = false
     @State private var showDeleteAudioConfirm = false
+    @State private var isShowingRecorder = false
     
     @Environment(\.dismiss) var dismiss
     
@@ -732,20 +964,61 @@ struct SongDetailView: View {
                             store.markPlayed(song)
                         }
                     }
-                } else {
-                    // No audio — import button
-                    Button(action: { showAudioPicker = true }) {
-                        Label("Importar Áudio", systemImage: "square.and.arrow.down")
-                            .font(.system(.subheadline, design: .rounded))
+                } else if isShowingRecorder || recorder.isRecording || recorder.recordingURL != nil {
+                    // Recording UI
+                    RecordingView(
+                        recorder: recorder,
+                        previewPlayer: previewPlayer,
+                        onSave: {
+                            if let url = recorder.recordingURL {
+                                song = store.saveRecording(from: url, for: song)
+                                recorder.recordingURL = nil
+                                recorder.recordingTime = 0
+                                isShowingRecorder = false
+                            }
+                        },
+                        onDiscard: {
+                            recorder.deleteRecording()
+                            isShowingRecorder = false
+                        }
+                    )
+                    .padding(.horizontal)
+                    .padding(.vertical, 10)
+                    .onAppear {
+                        let url = store.recordingURL(for: song)
+                        recorder.startRecording(to: url)
                     }
-                    .buttonStyle(.glass)
+                } else {
+                    // No audio — import or record
+                    HStack(spacing: 16) {
+                        Button(action: { showAudioPicker = true }) {
+                            Label("Importar", systemImage: "square.and.arrow.down")
+                                .font(.system(.subheadline, design: .rounded))
+                        }
+                        .buttonStyle(.glass)
+                        
+                        Button(action: { isShowingRecorder = true }) {
+                            Label("Gravar", systemImage: "mic.circle.fill")
+                                .font(.system(.subheadline, design: .rounded))
+                        }
+                        .buttonStyle(.glass)
+                    }
                     .padding(.vertical, 10)
                 }
             } else {
                 // Edit mode: audio management
                 HStack(spacing: 12) {
                     Button(action: { showAudioPicker = true }) {
-                        Label(song.audioFilename != nil ? "Trocar Áudio" : "Importar Áudio", systemImage: "square.and.arrow.down")
+                        Label(song.audioFilename != nil ? "Trocar Áudio" : "Importar", systemImage: "square.and.arrow.down")
+                            .font(.system(.caption, design: .rounded))
+                    }
+                    .buttonStyle(.glass)
+                    
+                    Button(action: {
+                        isEditing = false
+                        isShowingRecorder = true
+                    }) {
+                        Label(song.audioFilename != nil ? "Regravar" : "Gravar", systemImage: "mic.circle.fill")
                             .font(.system(.caption, design: .rounded))
                     }
                     .buttonStyle(.glass)
@@ -840,6 +1113,11 @@ struct SongDetailView: View {
         }
         .onDisappear {
             player.stop()
+            if recorder.isRecording {
+                recorder.stopRecording()
+                recorder.deleteRecording()
+            }
+            previewPlayer.stop()
         }
         .fileImporter(
             isPresented: $showAudioPicker,

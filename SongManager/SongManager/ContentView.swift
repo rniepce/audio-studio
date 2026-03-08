@@ -358,6 +358,15 @@ class AudioRecorder: ObservableObject {
     private var timer: Timer?
     
     func startRecording(to url: URL) {
+        AVAudioApplication.requestRecordPermission { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self = self, granted else { return }
+                self.beginRecording(to: url)
+            }
+        }
+    }
+    
+    private func beginRecording(to url: URL) {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
@@ -792,7 +801,8 @@ struct RecordingView: View {
                         
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Gravação")
-                                .font(.system(.subheadline, weight: .semibold, design: .rounded))
+                                .font(.system(.subheadline, design: .rounded))
+                                .fontWeight(.semibold)
                             Text(formatTime(recorder.recordingTime))
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(.secondary)
@@ -840,7 +850,8 @@ struct RecordingView: View {
                             onSave()
                         }) {
                             Label("Usar Gravação", systemImage: "checkmark.circle.fill")
-                                .font(.system(.subheadline, weight: .semibold, design: .rounded))
+                                .font(.system(.subheadline, design: .rounded))
+                                .fontWeight(.semibold)
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 16)
                                 .padding(.vertical, 8)
